@@ -1,0 +1,10 @@
+*.tar.gz
+*.Rcheck/
+*.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+Thumbs.db
+*~
+*.swp
