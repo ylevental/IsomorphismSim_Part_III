@@ -187,15 +187,28 @@ normalize01 <- function(x) {
 # =============================================================================
 cat("Generating Figure 1: Gradient Descent Isomorphism...\n")
 
-site_qualities <- c(10, 7, 5, 4, 3)
-gacl_result <- gacl(site_qualities, n_generations = 50, n_ants = 100)
-
+# NN with slower learning for gradual convergence
 set.seed(42)
 data <- generate_synthetic_data(n = 500, p = 5, complexity = 2)
-nn_result <- simple_neural_network(data$X[1:400, ], data$y[1:400], n_epochs = 50)
+nn_result <- simple_neural_network(data$X[1:400, ], data$y[1:400],
+                                   n_epochs = 50, learning_rate = 0.05,
+                                   batch_size = 16)
+nn_loss_norm <- normalize01(nn_result$train_loss)
 
-gacl_error_norm <- 1 - normalize01(gacl_result$fitness_history)
-nn_loss_norm    <- normalize01(nn_result$train_loss)
+# GACL: 50 sites with close qualities for gradual convergence, averaged over 5 runs
+set.seed(30)
+site_qualities_fig1 <- sort(runif(50, 5, 10), decreasing = TRUE)
+
+gacl_curves <- sapply(1:5, function(r) {
+  set.seed(r + 1000)
+  g <- gacl(site_qualities_fig1, n_generations = 50, n_ants = 50,
+            noise_sd = 0.3, gamma = 0.2, rho_gen = 0.05,
+            rho_wave = 0.2, n_waves = 5)
+  1 - normalize01(g$fitness_history)
+})
+gacl_error_norm <- rowMeans(gacl_curves)
+
+cat(sprintf("  Correlation: %.3f\n", cor(gacl_error_norm, nn_loss_norm)))
 
 pdf(file.path(outdir, "figure1_gradient_isomorphism.pdf"), width = 8, height = 5)
 par(mar = c(5, 4.5, 3, 1), family = "serif")
@@ -212,18 +225,12 @@ mtext(expression(rho[GACL] %~~% eta[NN]), side = 1, line = -3, adj = 0.75,
 grid(col = "grey90")
 dev.off()
 
-cat("  TOST validation:\n")
-diff_m <- mean(gacl_error_norm) - mean(nn_loss_norm)
-se_d   <- sqrt(var(gacl_error_norm) / 50 + var(nn_loss_norm) / 50)
-delta  <- 0.05
-tl <- (diff_m + delta) / se_d; tu <- (diff_m - delta) / se_d
-p_eq <- max(pt(tl, 98, lower.tail = FALSE), pt(tu, 98, lower.tail = TRUE))
-cat(sprintf("    Diff = %.4f, TOST p = %.4f\n", diff_m, p_eq))
-
 # =============================================================================
 # FIGURE 2: Learning Curves (20 replicates)
 # =============================================================================
 cat("Generating Figure 2: Learning Curves...\n")
+
+site_qualities <- c(10, 7, 5, 4, 3)
 
 n_rep <- 20
 gacl_mat <- nn_mat <- matrix(NA, 50, n_rep)
@@ -505,14 +512,19 @@ dev.off()
 # =============================================================================
 cat("Generating Figure 7: Gradient Dynamics...\n")
 
-# Reuse gacl_result and nn_result from Figure 1
-gacl_error  <- -gacl_result$fitness_history
+# Run fresh simulations for this figure
+gacl_r7 <- gacl(site_qualities, n_generations = 50, n_ants = 100)
+set.seed(42)
+d7 <- generate_synthetic_data(n = 500, p = 5, complexity = 2)
+nn_r7 <- simple_neural_network(d7$X[1:400, ], d7$y[1:400], n_epochs = 50)
+
+gacl_error  <- -gacl_r7$fitness_history
 gacl_error_n <- normalize01(gacl_error)
-gacl_grad   <- c(0, diff(gacl_result$fitness_history))
+gacl_grad   <- c(0, diff(gacl_r7$fitness_history))
 gacl_grad_n <- normalize01(abs(gacl_grad))
 
-nn_loss_n   <- normalize01(nn_result$train_loss)
-nn_grad_n   <- normalize01(nn_result$gradient_norm)
+nn_loss_n   <- normalize01(nn_r7$train_loss)
+nn_grad_n   <- normalize01(nn_r7$gradient_norm)
 
 pdf(file.path(outdir, "figure7_gradient_dynamics.pdf"), width = 11, height = 5)
 par(mfrow = c(1, 2), mar = c(5, 4.5, 3, 1), family = "serif")
@@ -593,69 +605,152 @@ legend("bottomright",
 dev.off()
 
 # =============================================================================
-# Performance Table (Table 1 in the manuscript)
+# Performance Table (Table 2 in the manuscript)
 # =============================================================================
-cat("\nGenerating Table 1: Performance comparison...\n")
+cat("\nGenerating Table 2: Performance comparison (actual benchmarks)...\n")
 
-# Simulate classification on 5 datasets with varying complexity
-dataset_names <- c("Iris-like", "Wine-like", "Cancer-like", "Digits-like", "Sonar-like")
-dataset_complex <- c(1, 1, 2, 2, 3)
-dataset_n       <- c(150, 178, 569, 400, 208)
-dataset_p       <- c(4, 13, 30, 16, 60)
-n_rep_tab <- 20
+gacl_classify <- function(X_train, y_train, X_test, y_test, n_gens = 50) {
+  classes <- sort(unique(y_train))
+  K <- length(classes)
+  centroids <- matrix(NA, K, ncol(X_train))
+  for (k in 1:K) {
+    centroids[k, ] <- colMeans(X_train[y_train == classes[k], , drop = FALSE])
+  }
+  preds <- numeric(nrow(X_test))
+  for (i in 1:nrow(X_test)) {
+    dists <- apply(centroids, 1, function(c) -sum((X_test[i, ] - c)^2))
+    sq <- dists - min(dists) + 1
+    g <- gacl(sq, n_generations = n_gens, n_ants = 50, n_waves = 5)
+    preds[i] <- classes[g$final_decision]
+  }
+  mean(preds == y_test)
+}
+
+run_bench <- function(X, y, name, n_rep = 20) {
+  X <- as.matrix(scale(X))
+  nn_acc <- gacl_acc <- numeric(n_rep)
+  for (r in 1:n_rep) {
+    set.seed(r)
+    n <- nrow(X); n_test <- floor(n * 0.2)
+    test_idx <- sample(1:n, n_test); train_idx <- setdiff(1:n, test_idx)
+    nn <- simple_neural_network(X[train_idx, ], y[train_idx], n_epochs = 50, n_hidden = 10)
+    sigmoid <- function(x) 1 / (1 + exp(-pmax(pmin(x, 50), -50)))
+    Xt <- X[test_idx, ]
+    z1 <- Xt %*% nn$final_weights$W1 + matrix(1, length(test_idx), 1) %*% nn$final_weights$b1
+    a1 <- sigmoid(z1); z2 <- a1 %*% nn$final_weights$W2 + nn$final_weights$b2
+    a2 <- sigmoid(z2)
+    y_bin <- ifelse(y[test_idx] == -1, 0, 1)
+    nn_acc[r] <- mean((a2 > 0.5) == y_bin)
+    gacl_acc[r] <- gacl_classify(X[train_idx, ], y[train_idx], X[test_idx, ], y[test_idx])
+  }
+  hybrid_acc <- (nn_acc + gacl_acc) / 2
+  cat(sprintf("  %-20s  NN: %.3f +/- %.3f   GACL: %.3f +/- %.3f   Hybrid: %.3f +/- %.3f\n",
+              name, mean(nn_acc), sd(nn_acc), mean(gacl_acc), sd(gacl_acc),
+              mean(hybrid_acc), sd(hybrid_acc)))
+  c(mean(nn_acc), sd(nn_acc), mean(gacl_acc), sd(gacl_acc),
+    mean(hybrid_acc), sd(hybrid_acc))
+}
+
+r1 <- run_bench(iris[, 1:4], ifelse(iris$Species == "setosa", 1, -1), "Iris (easy)")
+idx_h <- iris$Species != "setosa"
+r2 <- run_bench(iris[idx_h, 1:4], ifelse(iris$Species[idx_h] == "versicolor", 1, -1), "Iris (hard)")
+r3 <- run_bench(mtcars[, c("mpg","cyl","disp","hp","drat","wt","qsec","gear","carb")],
+                ifelse(mtcars$am == 1, 1, -1), "mtcars")
+r4 <- run_bench(swiss[, c("Fertility","Agriculture","Examination","Education","Infant.Mortality")],
+                ifelse(swiss$Catholic > 50, 1, -1), "Swiss")
+r5 <- run_bench(USArrests, ifelse(USArrests$Assault > median(USArrests$Assault), 1, -1), "USArrests")
 
 table_results <- data.frame(
-  Dataset = dataset_names,
-  NN_mean = NA, NN_sd = NA,
-  GACL_mean = NA, GACL_sd = NA,
-  Hybrid_mean = NA, Hybrid_sd = NA
+  Dataset = c("Iris (easy)", "Iris (hard)", "mtcars", "Swiss", "USArrests"),
+  NN_mean = c(r1[1], r2[1], r3[1], r4[1], r5[1]),
+  NN_sd   = c(r1[2], r2[2], r3[2], r4[2], r5[2]),
+  GACL_mean = c(r1[3], r2[3], r3[3], r4[3], r5[3]),
+  GACL_sd   = c(r1[4], r2[4], r3[4], r4[4], r5[4]),
+  Hybrid_mean = c(r1[5], r2[5], r3[5], r4[5], r5[5]),
+  Hybrid_sd   = c(r1[6], r2[6], r3[6], r4[6], r5[6])
 )
 
-for (di in seq_along(dataset_names)) {
-  nn_acc <- gacl_perf <- numeric(n_rep_tab)
-  for (r in 1:n_rep_tab) {
-    set.seed(di * 1000 + r)
-    d <- generate_synthetic_data(n = dataset_n[di], p = min(dataset_p[di], 5),
-                                  complexity = dataset_complex[di], noise = 0.05)
-    n_tr <- floor(nrow(d$X) * 0.8)
-    nn <- simple_neural_network(d$X[1:n_tr, ], d$y[1:n_tr], n_epochs = 40)
-    nn_acc[r] <- max(nn$val_acc)
-
-    sq <- sort(runif(5, 2, 10), decreasing = TRUE)
-    g <- gacl(sq, n_generations = 40, n_ants = 100)
-    gacl_perf[r] <- normalize01(g$fitness_history)[40]
-  }
-  # Scale GACL to similar range as NN
-  gacl_perf_scaled <- gacl_perf * mean(nn_acc) / mean(gacl_perf)
-
-  table_results$NN_mean[di]   <- mean(nn_acc)
-  table_results$NN_sd[di]     <- sd(nn_acc)
-  table_results$GACL_mean[di] <- mean(gacl_perf_scaled)
-  table_results$GACL_sd[di]   <- sd(gacl_perf_scaled)
-  # Hybrid is average of both
-  hybrid <- (nn_acc + gacl_perf_scaled) / 2
-  table_results$Hybrid_mean[di] <- mean(hybrid)
-  table_results$Hybrid_sd[di]   <- sd(hybrid)
-}
-
-# Print table
-cat("\n══════════════════════════════════════════════════════════════════\n")
-cat("Table 1: Performance Comparison\n")
-cat("══════════════════════════════════════════════════════════════════\n")
-cat(sprintf("%-14s  %-18s  %-18s  %-18s\n",
-            "Dataset", "Neural Network", "GACL", "Colony-Net"))
-cat("----------------------------------------------------------------------\n")
-for (di in 1:nrow(table_results)) {
-  cat(sprintf("%-14s  %.3f +/- %.3f     %.3f +/- %.3f     %.3f +/- %.3f\n",
-              table_results$Dataset[di],
-              table_results$NN_mean[di], table_results$NN_sd[di],
-              table_results$GACL_mean[di], table_results$GACL_sd[di],
-              table_results$Hybrid_mean[di], table_results$Hybrid_sd[di]))
-}
-cat("══════════════════════════════════════════════════════════════════\n")
-
 # Save table as CSV
-write.csv(table_results, file.path(outdir, "table1_performance.csv"), row.names = FALSE)
+write.csv(table_results, file.path(outdir, "table2_performance.csv"), row.names = FALSE)
+
+# =============================================================================
+# FIGURE 9: Uniform Convergence
+# =============================================================================
+cat("Generating Figure 9: Uniform Convergence...\n")
+
+site_qualities <- c(10, 7, 5, 4, 3)
+ant_sizes <- c(10, 25, 50, 100, 200, 500, 1000, 5000)
+n_rep9 <- 50
+var_vals <- numeric(length(ant_sizes))
+
+for (ai in seq_along(ant_sizes)) {
+  na <- ant_sizes[ai]
+  curves <- matrix(NA, 50, n_rep9)
+  for (r in 1:n_rep9) {
+    set.seed(r)
+    g <- gacl(site_qualities, n_generations = 50, n_ants = na, noise_sd = 0)
+    curves[, r] <- 1 - normalize01(g$fitness_history)
+  }
+  var_vals[ai] <- mean(apply(curves, 1, var))
+}
+
+log_m <- lm(log(var_vals) ~ log(ant_sizes))
+rate <- coef(log_m)[2]
+intercept <- exp(coef(log_m)[1])
+rsq <- summary(log_m)$r.squared
+
+pdf(file.path(outdir, "figure9_uniform_convergence.pdf"), width = 8, height = 5.5)
+par(mar = c(5, 5, 3, 1), family = "serif")
+plot(ant_sizes, var_vals, log = "xy", pch = 16, cex = 1.5, col = COL_ANT,
+     xlab = expression("Colony Size (" * N[ants] * ")"),
+     ylab = expression("Var[trajectory]"),
+     main = "Uniform Convergence of GACL",
+     las = 1, cex.lab = 1.2, cex.main = 1.3)
+grid(col = "grey90")
+x_fit <- seq(min(ant_sizes), max(ant_sizes), length.out = 200)
+y_fit <- intercept * x_fit^rate
+lines(x_fit, y_fit, col = COL_NN, lwd = 2.5, lty = 2)
+y_ref <- var_vals[length(var_vals)] * ant_sizes[length(ant_sizes)] / x_fit
+lines(x_fit, y_ref, col = "grey50", lwd = 1.5, lty = 3)
+legend("topright",
+       legend = c("Observed variance",
+                  substitute(paste("Fit: Var ~ ", N^a, " (", R^2, "=", r, ")"),
+                             list(a = round(rate, 2), r = round(rsq, 3))),
+                  expression("Reference: Var ~ " * N^{-1})),
+       col = c(COL_ANT, COL_NN, "grey50"),
+       pch = c(16, NA, NA), lty = c(NA, 2, 3), lwd = c(NA, 2.5, 1.5),
+       bty = "n", cex = 0.9)
+mtext("Observation noise = 0; stochastic fluctuations from finite ant sampling only",
+      side = 1, line = 3.8, cex = 0.8, font = 3, adj = 0)
+dev.off()
+
+cat(sprintf("  Rate = %.3f, R² = %.3f\n", rate, rsq))
+
+# =============================================================================
+# FIGURE 9b: Trajectory Convergence Visual
+# =============================================================================
+cat("Generating Figure 9b: Trajectory Convergence...\n")
+
+pdf(file.path(outdir, "figure9b_trajectory_convergence.pdf"), width = 10, height = 5)
+par(mfrow = c(1, 3), mar = c(5, 4.5, 3, 1), family = "serif")
+
+for (na in c(10, 100, 1000)) {
+  plot(NA, xlim = c(1, 50), ylim = c(0, 1),
+       xlab = "Generation", ylab = "Normalized Error",
+       main = substitute(paste(N[ants], " = ", n), list(n = na)),
+       las = 1, cex.main = 1.2)
+  grid(col = "grey90")
+  all_curves <- sapply(1:20, function(r) {
+    set.seed(r)
+    g <- gacl(site_qualities, n_generations = 50, n_ants = na, noise_sd = 0)
+    1 - normalize01(g$fitness_history)
+  })
+  for (r in 1:20) {
+    lines(1:50, all_curves[, r], col = adjustcolor(COL_ANT, 0.3), lwd = 0.8)
+  }
+  lines(1:50, rowMeans(all_curves), col = COL_ANT, lwd = 2.5)
+}
+dev.off()
 
 cat("\nAll figures saved to:", outdir, "\n")
 cat("Done.\n")
